@@ -1,188 +1,223 @@
+#!/usr/bin/env python3
+
 import os
 import sys
 import argparse
 import logging
 import requests
 import shutil
+import tempfile
+import fcntl
+
 from pathlib import Path
-from mutagen import File as MutagenFile
 
-def get_config():
-    parser = argparse.ArgumentParser(description="Sync media from ytdl-material and update Plex.")
+LOCKFILE = '/tmp/ytdl_sync.lock'
 
-    parser.add_argument("--ytdl-url", default=os.getenv("YTDL_URL"),
-                        help="Base URL of the ytdl-material instance")
-    parser.add_argument("--plex-url", default=os.getenv("PLEX_URL"),
-                        help="Base URL of Plex server")
-    parser.add_argument("--plex-token", default=os.getenv("PLEX_TOKEN"),
-                        help="Authentication token for Plex")
-    parser.add_argument("--plex-section-id", default=os.getenv("PLEX_MUSIC_SECTION_ID"),
-                        help="Plex library section ID for music")
-    parser.add_argument("--download-dir", default=os.getenv("LOCAL_DOWNLOAD_DIR", "/music"),
-                        help="Directory to store synced media")
-    parser.add_argument("--log-path", default=os.getenv("LOG_PATH", None),
-                        help="Path to log file (optional, logs to stdout if not set)")
-    parser.add_argument("--lock-path", default=os.getenv("LOCK_FILE_PATH", "/tmp/ytdl_sync.lock"),
-                        help="Path to lock file")
-    parser.add_argument("--ytdl-username", default=os.getenv("YTDL_USERNAME"),
-                        help="YTDL-Material username")
-    parser.add_argument("--ytdl-password", default=os.getenv("YTDL_PASSWORD"),
-                        help="YTDL-Material password")
-    args = parser.parse_args()
-
-    missing = []
-    for req in ["ytdl_url", "plex_url", "plex_token", "plex_section_id"]:
-        if not getattr(args, req):
-            missing.append(req)
-
-    if missing:
-        parser.error(f"Missing required arguments or environment variables: {', '.join(missing)}")
-
-    if (args.ytdl_username is None) or (args.ytdl_password is None):
-        logging.warning("No YTDL username/password provided, will attempt unauthenticated sync (all files).")
-
-    return args
-
-def setup_logging(log_path):
+def setup_logging(log_path=None):
+    log_handlers = [logging.StreamHandler(sys.stdout)]
     if log_path:
-        log_dir = Path(log_path).parent
         try:
+            log_dir = Path(log_path).parent
             log_dir.mkdir(parents=True, exist_ok=True)
-            handlers = [
-                logging.FileHandler(log_path),
-                logging.StreamHandler(sys.stdout)
-            ]
+            log_handlers.append(logging.FileHandler(log_path))
         except Exception as e:
-            print(f"Warning: Could not create log directory {log_dir}, logging only to stdout. Error: {e}")
-            handlers = [logging.StreamHandler(sys.stdout)]
-    else:
-        handlers = [logging.StreamHandler(sys.stdout)]
+            print(f"Warning: could not open log file {log_path} for writing: {e}")
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=handlers
+        format='%(asctime)s %(levelname)s: %(message)s',
+        handlers=log_handlers
     )
 
-def acquire_lock(lock_path):
-    if os.path.isdir(lock_path):
-        logging.error(f"Lock path '{lock_path}' is a directory, not a file. Exiting.")
+
+def obtain_lock(lockfile_path=LOCKFILE):
+    # If the lockfile path exists but is a directory, error out
+    if os.path.exists(lockfile_path) and os.path.isdir(lockfile_path):
+        logging.error(f"Lockfile path {lockfile_path} is a directory. Please remove or rename it.")
         sys.exit(1)
 
-    if os.path.exists(lock_path):
-        logging.warning("Lock file exists. Another sync may be in progress. Exiting.")
-        sys.exit(0)
-
-    with open(lock_path, 'w') as f:
-        f.write(str(os.getpid()))
-
-def release_lock(lock_path):
-    if os.path.exists(lock_path):
-        os.remove(lock_path)
-
-def login_ytdl(base_url, username, password):
-    login_url = f"{base_url}/api/auth/login"
+    lockfile = open(lockfile_path, 'a+')
     try:
-        response = requests.post(login_url, json={"username": username, "password": password})
-        response.raise_for_status()
-        token = response.json().get('token')
-        if not token:
-            logging.error("No token received from YTDL login response")
-            sys.exit(1)
-        logging.info(f"Authenticated with YTDL as '{username}'")
-        return token
-    except requests.RequestException as e:
-        logging.error(f"Failed to authenticate with YTDL: {e}")
+        fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lockfile
+    except IOError:
+        logging.error("Another instance is running. Exiting.")
         sys.exit(1)
 
-def fetch_ytdl_files(base_url, token=None):
-    url = f"{base_url}/api/files"
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        resp = requests.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        logging.error(f"Failed to contact YTDL API: {e}")
-        sys.exit(1)
 
-def download_and_delete_files(base_url, files, download_dir, token=None):
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+class YTDLMaterialAPI:
+    def __init__(self, base_url, api_key, username=None, password=None):
+        self.base_url = base_url.rstrip('/')
+        self.api_key = api_key
+        self.username = username
+        self.password = password
+        self.jwt_token = None
+        self.session = requests.Session()
 
-    for file in files:
-        filename = file.get('filename') or file.get('title') or file.get('id')
-        if not filename:
-            logging.warning(f"Skipping file with missing filename/id: {file}")
-            continue
+        if self.username and self.password:
+            self._login()
 
-        download_url = f"{base_url}/api/download/{file['uid']}"
+    def _login(self):
+        auth_url = f"{self.base_url}/api/auth/login"
+        params = {'api_key': self.api_key}
+        payload = {
+            "username": self.username,
+            "password": self.password
+        }
         try:
-            with requests.get(download_url, headers=headers, stream=True) as r:
+            r = self.session.post(auth_url, params=params, json=payload, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            self.jwt_token = data.get('token')
+            if not self.jwt_token:
+                logging.error("Login succeeded but no token received.")
+                sys.exit(1)
+            logging.info(f"Obtained JWT token for user '{self.username}'")
+        except requests.RequestException as e:
+            logging.error(f"Failed to login to YTDL Material API: {e}")
+            sys.exit(1)
+
+    def _headers(self):
+        headers = {}
+        if self.jwt_token:
+            headers['Authorization'] = f"Bearer {self.jwt_token}"
+        return headers
+
+    def list_files(self, user=None):
+        url = f"{self.base_url}/api/files"
+        params = {'api_key': self.api_key}
+        if user:
+            params['user'] = user
+        try:
+            r = self.session.get(url, params=params, headers=self._headers(), timeout=15)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            logging.error(f"Failed to list files from YTDL Material API: {e}")
+            sys.exit(1)
+
+    def download_file(self, file_id, dest_path):
+        url = f"{self.base_url}/api/files/{file_id}/download"
+        params = {'api_key': self.api_key}
+        try:
+            with self.session.get(url, params=params, headers=self._headers(), stream=True, timeout=30) as r:
                 r.raise_for_status()
-                dest = Path(download_dir) / filename
-                with open(dest, 'wb') as f:
+                with open(dest_path, 'wb') as f:
                     shutil.copyfileobj(r.raw, f)
-            logging.info(f"Downloaded {filename}")
+            logging.info(f"Downloaded file ID {file_id} to {dest_path}")
+        except requests.RequestException as e:
+            logging.error(f"Failed to download file {file_id}: {e}")
+            sys.exit(1)
 
-            tag_file(dest)
+    def delete_file(self, file_id):
+        url = f"{self.base_url}/api/files/{file_id}"
+        params = {'api_key': self.api_key}
+        try:
+            r = self.session.delete(url, params=params, headers=self._headers(), timeout=10)
+            r.raise_for_status()
+            logging.info(f"Deleted file ID {file_id} from YTDL Material")
+        except requests.RequestException as e:
+            logging.error(f"Failed to delete file {file_id}: {e}")
+            sys.exit(1)
 
-            del_url = f"{base_url}/api/files/{file['uid']}"
-            del_resp = requests.delete(del_url, headers=headers)
-            del_resp.raise_for_status()
-            logging.info(f"Deleted {filename} from YTDL")
-        except Exception as e:
-            logging.error(f"Failed processing file '{filename}': {e}")
 
-def tag_file(file_path):
-    try:
-        audio = MutagenFile(file_path, easy=True)
-        if audio is None:
-            logging.warning(f"Cannot read audio metadata for {file_path.name}")
-            return
-        # Placeholder: musicbrainz tagging logic can be added here
-        audio.save()
-    except Exception as e:
-        logging.warning(f"Failed to tag {file_path.name}: {e}")
+class PlexAPI:
+    def __init__(self, base_url, token, library_section_id):
+        self.base_url = base_url.rstrip('/')
+        self.token = token
+        self.library_section_id = library_section_id
+        self.session = requests.Session()
 
-def trigger_plex_scan(plex_url, token, section_id):
-    try:
-        url = f"{plex_url}/library/sections/{section_id}/refresh?X-Plex-Token={token}"
-        resp = requests.get(url)
-        resp.raise_for_status()
-        logging.info("Triggered Plex scan")
-    except requests.RequestException as e:
-        logging.error(f"Failed to contact Plex: {e}")
-        sys.exit(1)
+    def trigger_library_scan(self):
+        url = f"{self.base_url}/library/sections/{self.library_section_id}/refresh"
+        headers = {
+            'X-Plex-Token': self.token
+        }
+        try:
+            r = self.session.get(url, headers=headers, timeout=10)
+            r.raise_for_status()
+            logging.info("Triggered Plex library scan successfully")
+        except requests.RequestException as e:
+            logging.error(f"Failed to trigger Plex library scan: {e}")
+            sys.exit(1)
+
+
+def rename_and_organize_file(src_path, dest_dir):
+    # Placeholder for MusicBrainz tagging and renaming logic
+    # For now, just move the file to dest_dir preserving the filename
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / Path(src_path).name
+    shutil.move(src_path, dest_path)
+    logging.info(f"Moved file to {dest_path}")
+    return dest_path
+
 
 def main():
-    args = get_config()
+    parser = argparse.ArgumentParser(description="Sync files from YTDL Material and optionally trigger Plex library scan")
+    parser.add_argument('--ytdl-url', default=os.getenv('YTDL_URL'), help='Base URL of YTDL Material API')
+    parser.add_argument('--ytdl-api-key', default=os.getenv('YTDL_API_KEY'), help='YTDL Material API key')
+    parser.add_argument('--ytdl-user', default=os.getenv('YTDL_USER'), help='YTDL Material username to authenticate as (optional)')
+    parser.add_argument('--ytdl-password', default=os.getenv('YTDL_PASSWORD'), help='YTDL Material password for user (optional)')
+    parser.add_argument('--plex-url', default=os.getenv('PLEX_URL'), help='Base URL of Plex server')
+    parser.add_argument('--plex-token', default=os.getenv('PLEX_TOKEN'), help='Plex token')
+    parser.add_argument('--plex-music-section-id', default=os.getenv('PLEX_MUSIC_SECTION_ID'), help='Plex Music library section ID')
+    parser.add_argument('--download-dir', default=os.getenv('DOWNLOAD_DIR', '/data'), help='Directory to store downloaded files')
+    parser.add_argument('--lock-file', default=os.getenv('LOCK_FILE', LOCKFILE), help='Path to lock file')
+    parser.add_argument('--log-path', default=os.getenv('LOG_PATH'), help='Path to log file (optional)')
+    args = parser.parse_args()
+
+    if not args.ytdl_url or not args.ytdl_api_key:
+        print("YTDL URL and API key must be specified via args or environment variables.")
+        sys.exit(1)
+
+    if (args.ytdl_user and not args.ytdl_password) or (args.ytdl_password and not args.ytdl_user):
+        print("Both YTDL user and password must be specified to authenticate as a user.")
+        sys.exit(1)
+
+    if args.plex_url or args.plex_token or args.plex_music_section_id:
+        if not (args.plex_url and args.plex_token and args.plex_music_section_id):
+            print("If any Plex argument is specified, all Plex arguments must be specified.")
+            sys.exit(1)
+
     setup_logging(args.log_path)
-    acquire_lock(args.lock_path)
 
-    try:
-        Path(args.download_dir).mkdir(parents=True, exist_ok=True)
+    lockfile = obtain_lock(args.lock_file)
 
-        jwt_token = None
-        if args.ytdl_username and args.ytdl_password:
-            jwt_token = login_ytdl(args.ytdl_url, args.ytdl_username, args.ytdl_password)
-        else:
-            logging.info("No YTDL credentials provided, attempting unauthenticated access")
+    ytdl = YTDLMaterialAPI(
+        base_url=args.ytdl_url,
+        api_key=args.ytdl_api_key,
+        username=args.ytdl_user,
+        password=args.ytdl_password
+    )
 
-        files = fetch_ytdl_files(args.ytdl_url, jwt_token)
+    plex = None
+    if args.plex_url and args.plex_token and args.plex_music_section_id:
+        plex = PlexAPI(args.plex_url, args.plex_token, args.plex_music_section_id)
 
-        if not files:
-            logging.info("No files to sync")
-        else:
-            download_and_delete_files(args.ytdl_url, files, args.download_dir, jwt_token)
-            trigger_plex_scan(args.plex_url, args.plex_token, args.plex_section_id)
+    files = ytdl.list_files(user=args.ytdl_user)
+    if not files:
+        logging.info("No files to sync.")
+    else:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for f in files:
+                file_id = f['id']
+                filename = f['filename']
+                logging.info(f"Processing file {file_id} ({filename})")
 
-        logging.info("Sync completed")
-    finally:
-        release_lock(args.lock_path)
+                tmp_path = os.path.join(tmpdir, filename)
+                ytdl.download_file(file_id, tmp_path)
 
-if __name__ == '__main__':
+                final_path = rename_and_organize_file(tmp_path, args.download_dir)
+
+                ytdl.delete_file(file_id)
+
+    if plex:
+        plex.trigger_library_scan()
+
+    logging.info("Sync completed.")
+
+
+if __name__ == "__main__":
     main()
+

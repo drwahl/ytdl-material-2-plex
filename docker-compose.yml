@@ -5,24 +5,21 @@ services:
     container_name: ytdl_sync
     restart: unless-stopped
     environment:
-      # YTDL-material config
-      - YTDL_URL=http://ytdl.example.com
-      - YTDL_USERNAME=username
-      - YTDL_PASSWORD=password
+      YTDL_URL: http://ytdl.example.com
+      YTDL_USER: user
+      YTDL_PASSWORD: pass
+      YTDL_API_KEY: keykeykey
 
-      # Plex config
-      - PLEX_URL=http://plex.local:32400
-      - PLEX_TOKEN=your_plex_token
-      - PLEX_MUSIC_SECTION_ID=1
+      PLEX_URL: http://plex.local:32400
+      PLEX_TOKEN: your_plex_token
+      PLEX_MUSIC_SECTION_ID: "1"
 
-      # Local download dir inside container
-      - LOCAL_DOWNLOAD_DIR=/music
+      DOWNLOAD_DIR: /music
 
-      # Optional: log file path inside container, comment out to disable file logging
-      # - LOG_PATH=/logs/ytdl_sync.log
+      # Optional: enable log file path inside container (comment out to disable)
+      # LOG_PATH: /logs/ytdl_sync.log
 
-      # Lock file path (can stay default or customize)
-      - LOCK_FILE_PATH=/tmp/ytdl_sync.lock
+      LOCK_FILE: /tmp/ytdl_sync.lock
 
     volumes:
       # Mount your music library directory here
