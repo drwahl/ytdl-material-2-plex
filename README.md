@@ -33,7 +33,7 @@ Run the container, mapping the music directory and optional lockfile path:
       -e PLEX_URL=http://host.docker.internal:32400 \
       -e PLEX_TOKEN=your_plex_token \
       -e PLEX_MUSIC_SECTION_ID=4 \
-      your-dockerhub-username/ytdl-sync:latest
+      drwahl/ytdl-sync:latest
 
 ## Building Locally
 
