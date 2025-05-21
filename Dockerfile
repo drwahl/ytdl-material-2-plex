@@ -3,27 +3,23 @@ FROM python:3.11-slim
 LABEL maintainer="david.wahlstrom@gmail.com"
 LABEL org.opencontainers.image.source="https://github.com/drwahl/ytdl-material-2-plex"
 
-# Install system deps
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Create a non-root user and prepare writable dirs
-RUN useradd -m appuser
-RUN mkdir -p /music /tmp && chown -R appuser:appuser /music /tmp
-
 # Set working directory
 WORKDIR /app
 
-# Copy and install dependencies
+# Copy requirements (if you have any external dependencies)
 COPY requirements.txt .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy script
+# Copy the sync script
 COPY sync.py .
 
-USER appuser
+# Create a user to run the app (not root)
+RUN addgroup --system ytdlgroup && adduser --system ytdluser --ingroup ytdlgroup
+RUN chown -R ytdluser:ytdlgroup /app
 
-ENTRYPOINT ["python"]
-CMD ["sync.py"]
+USER ytdluser
+
+# Default command
+CMD ["python", "sync.py"]

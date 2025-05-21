@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import sys
 import argparse
@@ -29,7 +28,6 @@ def get_config():
                         help="YTDL-Material username")
     parser.add_argument("--ytdl-password", default=os.getenv("YTDL_PASSWORD"),
                         help="YTDL-Material password")
-
     args = parser.parse_args()
 
     missing = []
@@ -39,6 +37,9 @@ def get_config():
 
     if missing:
         parser.error(f"Missing required arguments or environment variables: {', '.join(missing)}")
+
+    if (args.ytdl_username is None) or (args.ytdl_password is None):
+        logging.warning("No YTDL username/password provided, will attempt unauthenticated sync (all files).")
 
     return args
 
@@ -79,48 +80,70 @@ def release_lock(lock_path):
     if os.path.exists(lock_path):
         os.remove(lock_path)
 
-def login_ytdl(session, base_url, username, password):
+def login_ytdl(base_url, username, password):
     login_url = f"{base_url}/api/auth/login"
-    resp = session.post(login_url, json={"username": username, "password": password})
-    resp.raise_for_status()
-    return session
-
-def fetch_ytdl_files(session, base_url):
     try:
-        resp = session.get(f"{base_url}/api/files")
+        response = requests.post(login_url, json={"username": username, "password": password})
+        response.raise_for_status()
+        token = response.json().get('token')
+        if not token:
+            logging.error("No token received from YTDL login response")
+            sys.exit(1)
+        logging.info(f"Authenticated with YTDL as '{username}'")
+        return token
+    except requests.RequestException as e:
+        logging.error(f"Failed to authenticate with YTDL: {e}")
+        sys.exit(1)
+
+def fetch_ytdl_files(base_url, token=None):
+    url = f"{base_url}/api/files"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = requests.get(url, headers=headers)
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as e:
         logging.error(f"Failed to contact YTDL API: {e}")
         sys.exit(1)
 
-def download_and_delete_files(session, base_url, files, download_dir):
+def download_and_delete_files(base_url, files, download_dir, token=None):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     for file in files:
-        name = file.get('title') or file.get('id')
+        filename = file.get('filename') or file.get('title') or file.get('id')
+        if not filename:
+            logging.warning(f"Skipping file with missing filename/id: {file}")
+            continue
+
         download_url = f"{base_url}/api/download/{file['uid']}"
         try:
-            resp = session.get(download_url, stream=True)
-            resp.raise_for_status()
-
-            dest = Path(download_dir) / file['filename']
-            with open(dest, 'wb') as f:
-                shutil.copyfileobj(resp.raw, f)
-            logging.info(f"Downloaded {file['filename']}")
+            with requests.get(download_url, headers=headers, stream=True) as r:
+                r.raise_for_status()
+                dest = Path(download_dir) / filename
+                with open(dest, 'wb') as f:
+                    shutil.copyfileobj(r.raw, f)
+            logging.info(f"Downloaded {filename}")
 
             tag_file(dest)
 
-            del_resp = session.delete(f"{base_url}/api/files/{file['uid']}")
+            del_url = f"{base_url}/api/files/{file['uid']}"
+            del_resp = requests.delete(del_url, headers=headers)
             del_resp.raise_for_status()
-            logging.info(f"Deleted {file['filename']} from YTDL")
+            logging.info(f"Deleted {filename} from YTDL")
         except Exception as e:
-            logging.error(f"Failed to process file '{name}': {e}")
+            logging.error(f"Failed processing file '{filename}': {e}")
 
 def tag_file(file_path):
     try:
         audio = MutagenFile(file_path, easy=True)
         if audio is None:
+            logging.warning(f"Cannot read audio metadata for {file_path.name}")
             return
-        # Placeholder for tagging logic, e.g. use MusicBrainz here
+        # Placeholder: musicbrainz tagging logic can be added here
         audio.save()
     except Exception as e:
         logging.warning(f"Failed to tag {file_path.name}: {e}")
@@ -143,18 +166,18 @@ def main():
     try:
         Path(args.download_dir).mkdir(parents=True, exist_ok=True)
 
-        session = requests.Session()
+        jwt_token = None
         if args.ytdl_username and args.ytdl_password:
-            login_ytdl(session, args.ytdl_url, args.ytdl_username, args.ytdl_password)
-            logging.info(f"Authenticated with YTDL as '{args.ytdl_username}'")
+            jwt_token = login_ytdl(args.ytdl_url, args.ytdl_username, args.ytdl_password)
         else:
-            logging.info("Running unauthenticated YTDL sync (all files)")
+            logging.info("No YTDL credentials provided, attempting unauthenticated access")
 
-        files = fetch_ytdl_files(session, args.ytdl_url)
+        files = fetch_ytdl_files(args.ytdl_url, jwt_token)
+
         if not files:
             logging.info("No files to sync")
         else:
-            download_and_delete_files(session, args.ytdl_url, files, args.download_dir)
+            download_and_delete_files(args.ytdl_url, files, args.download_dir, jwt_token)
             trigger_plex_scan(args.plex_url, args.plex_token, args.plex_section_id)
 
         logging.info("Sync completed")

@@ -1,26 +1,35 @@
-version: '3.8'
-
+version: "3.9"
 services:
-  ytdl-sync:
-    image: drwahl/ytdl-sync:latest
+  ytdl_sync:
+    build: .
     container_name: ytdl_sync
     restart: unless-stopped
     environment:
-      - YTDL_URL=http://ytdl-material:17442
-      - PLEX_URL=http://plex-server:32400
-      - PLEX_TOKEN=YOUR_PLEX_TOKEN_HERE
+      # YTDL-material config
+      - YTDL_URL=http://ytdl.example.com
+      - YTDL_USERNAME=username
+      - YTDL_PASSWORD=password
+
+      # Plex config
+      - PLEX_URL=http://plex.local:32400
+      - PLEX_TOKEN=your_plex_token
       - PLEX_MUSIC_SECTION_ID=1
+
+      # Local download dir inside container
       - LOCAL_DOWNLOAD_DIR=/music
-      - LOG_PATH=/logs/ytdl_sync.log
+
+      # Optional: log file path inside container, comment out to disable file logging
+      # - LOG_PATH=/logs/ytdl_sync.log
+
+      # Lock file path (can stay default or customize)
       - LOCK_FILE_PATH=/tmp/ytdl_sync.lock
+
     volumes:
-      - /path/to/local/music:/music:rw
-      #- /tmp:/tmp:rw  # Used for the lock file. Only needed if multiple containers might run
-      #- /path/to/local/logs:/logs:rw
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    # Uncomment below if you want to run this as a cron job inside the container (example runs every hour)
-    # command: ["sh", "-c", "while true; do python /app/sync.py; sleep 3600; done"]
+      # Mount your music library directory here
+      - /path/on/host/music:/music:rw
+
+      # Optional: mount a logs directory if LOG_PATH is set
+      # - /path/on/host/logs:/logs:rw
+
+    # Run once daily via external cron, or schedule here with restart: unless-stopped
+
