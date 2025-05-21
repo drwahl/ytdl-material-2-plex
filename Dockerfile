@@ -1,22 +1,29 @@
 FROM python:3.11-slim
 
-# Optional for AcoustID fingerprinting
-RUN apt-get update && apt-get install -y \
-    libchromaprint-tools \
-    && rm -rf /var/lib/apt/lists/*
+LABEL maintainer="david.wahlstrom@gmail.com"
+LABEL org.opencontainers.image.source="https://github.com/drwahl/ytdl-material-2-plex"
 
-# Create working directory
+# Install system deps
+RUN apt-get update && \
+    apt-get install -y ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user and prepare writable dirs
+RUN useradd -m appuser
+RUN mkdir -p /music /tmp && chown -R appuser:appuser /music /tmp
+
+# Set working directory
 WORKDIR /app
 
-# Copy in dependencies and script
+# Copy and install dependencies
 COPY requirements.txt .
-COPY sync.py .
-COPY entrypoint.sh .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Make entrypoint executable
-RUN chmod +x entrypoint.sh
+# Copy script
+COPY sync.py .
 
-ENTRYPOINT ["./entrypoint.sh"]
+USER appuser
+
+ENTRYPOINT ["python"]
+CMD ["sync.py"]
