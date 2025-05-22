@@ -136,6 +136,9 @@ def main():
                         default=os.environ.get("YTDL_PASSWORD"))
     parser.add_argument(
         "--ytdl-api-key", default=os.environ.get("YTDL_API_KEY"))
+    parser.add_argument("--ytdl-cleanup-synced",
+                        default=os.environ.get("YTDL_CLEANUP_SYNCED", False),
+                        action='store_true')
 
     parser.add_argument("--plex-url", default=os.environ.get("PLEX_URL"))
     parser.add_argument("--plex-token", default=os.environ.get("PLEX_TOKEN"))
@@ -208,6 +211,12 @@ def main():
             if args.plex_url and args.plex_token and args.plex_section_id:
                 trigger_plex_rescan(
                     args.plex_url, args.plex_token, args.plex_section_id)
+
+            if args.ytdl_cleanup_synced:
+                for file in files['mp3s']:
+                    logging.info("Cleaning up synced files from YTDL.")
+                    delete_file(args, file, ytdl_auth_params)
+                    logging.info("Successfully removed synced files from YTDL.")
 
             logging.info("Sync completed.")
     except Timeout:
