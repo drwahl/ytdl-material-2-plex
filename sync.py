@@ -66,8 +66,6 @@ def fetch_file_list(ytdl_url, api_key, jwt_token):
         if jwt_token:
             params["jwt"] = jwt_token
         resp = requests.get(f"{ytdl_url}/api/getMp3s", params=params)
-        import ipdb
-        ipdb.set_trace()
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
