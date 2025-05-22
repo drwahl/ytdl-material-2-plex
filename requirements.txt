@@ -1,3 +1,5 @@
+python-dotenv
+filelock
 musicbrainzngs
 mutagen
 requests

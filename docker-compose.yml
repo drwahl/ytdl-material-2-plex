@@ -1,25 +1,23 @@
 version: "3.9"
 services:
   ytdl_sync:
-    build: .
+    image: drwahl/ytdl-sync:latest
     container_name: ytdl_sync
     restart: unless-stopped
     environment:
+      ## YTDL config
       YTDL_URL: http://ytdl.example.com
       YTDL_USER: user
       YTDL_PASSWORD: pass
       YTDL_API_KEY: keykeykey
-
+      ## Plex config
       PLEX_URL: http://plex.local:32400
       PLEX_TOKEN: your_plex_token
       PLEX_MUSIC_SECTION_ID: "1"
-
-      DOWNLOAD_DIR: /music
-
-      # Optional: enable log file path inside container (comment out to disable)
+      # location within container to download the files to
+      LOCAL_DOWNLOAD_DIR: /music
       # LOG_PATH: /logs/ytdl_sync.log
-
-      LOCK_FILE: /tmp/ytdl_sync.lock
+      LOCK_FILE_PATH: /tmp/ytdl_sync.lock
 
     volumes:
       # Mount your music library directory here
