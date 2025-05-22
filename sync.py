@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import json
-import time
-import shutil
-import logging
-import argparse
-import requests
-from pathlib import Path
-from filelock import FileLock, Timeout
 from dotenv import load_dotenv
-
-# Load .env config
+from filelock import FileLock, Timeout
+from pathlib import Path
+from pprint import pprint
+from xml.dom import minidom
+import argparse
+import json
+import logging
+import os
+import requests
+import shutil
+import sys
+import time
 
 
 def load_config():
+    """Load .env config"""
     config_path = os.environ.get("CONFIG_PATH")
     if not config_path:
         home_env = Path.home() / ".ytdl_sync.env"
@@ -27,10 +28,9 @@ def load_config():
     if config_path:
         load_dotenv(dotenv_path=Path(config_path))
 
-# Setup logging
-
 
 def setup_logging(log_path=None):
+    """Setup logging"""
     handlers = [logging.StreamHandler()]
     if log_path:
         try:
@@ -41,10 +41,9 @@ def setup_logging(log_path=None):
     logging.basicConfig(level=logging.INFO,
                         format='%(levelname)s:%(message)s', handlers=handlers)
 
-# Authenticate to YTDL to get JWT token
-
 
 def ytdl_authenticate(ytdl_url, username, password, api_key):
+    """Authenticate to YTDL to get JWT token"""
     try:
         auth_resp = requests.post(
             f"{ytdl_url}/api/auth/login",
@@ -57,48 +56,48 @@ def ytdl_authenticate(ytdl_url, username, password, api_key):
         logging.error(f"Failed to authenticate with YTDL: {e}")
         return None
 
-# Fetch file list
 
-
-def fetch_file_list(ytdl_url, api_key, jwt_token):
+def fetch_file_list(ytdl_url, auth_params):
+    """Fetch file list"""
     try:
-        params = {"apiKey": api_key}
-        if jwt_token:
-            params["jwt"] = jwt_token
-        resp = requests.get(f"{ytdl_url}/api/getMp3s", params=params)
+        resp = requests.get(f"{ytdl_url}/api/getMp3s", params=auth_params)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
         logging.error(f"Failed to contact YTDL API: {e}")
         return None
 
-# Download file
 
-
-def download_file(url, dest_path):
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        with open(dest_path, 'wb') as f:
-            shutil.copyfileobj(r.raw, f)
-
-# Delete file on YTDL
-
-
-def delete_file(ytdl_url, file_uid, api_key, jwt_token):
+def download_file(args, file, dest_path, auth_params):
+    """Download file"""
     try:
-        headers = {"apiKey": api_key}
-        if jwt_token:
-            headers["Authorization"] = f"Bearer {jwt_token}"
-        resp = requests.delete(
-            f"{ytdl_url}/api/files/{file_uid}", headers=headers)
+        result = requests.post(
+            f'{args.ytdl_url}/api/downloadFileFromServer',
+            params=auth_params,
+            headers={'Content-type': 'application/json'},
+            json={"uid": file['uid'], "type": "audio"})
+        result.raise_for_status()
+        with open(dest_path, 'wb') as f:
+            f.write(result.content)
+    except Exception as e:
+        logging.error(f"Failed to download/save file {file['uid']}: {e}")
+
+
+def delete_file(args, file, auth_params):
+    """Delete file on YTDL"""
+    try:
+        resp = requests.post(
+            f"{args.ytdl_url}/api/deleteFile",
+            headers={"Content-type": "application/json"},
+            params=auth_params,
+            json={"uid": file['uid']})
         resp.raise_for_status()
     except Exception as e:
         logging.error(f"Failed to delete file {file_uid}: {e}")
 
-# Trigger Plex rescan
-
 
 def trigger_plex_rescan(plex_url, plex_token, section_id):
+    """Trigger Plex rescan"""
     try:
         url = f"{plex_url}/library/sections/{section_id}/refresh?X-Plex-Token={plex_token}"
         resp = requests.get(url)
@@ -106,6 +105,25 @@ def trigger_plex_rescan(plex_url, plex_token, section_id):
         logging.info("Plex rescan triggered.")
     except Exception as e:
         logging.error(f"Failed to trigger Plex rescan: {e}")
+
+
+def plex_list_sections(args):
+    """List the sections that are registered in Plex"""
+    sections = []
+    try:
+        url = f"{args.plex_url}/library/sections?X-Plex-Token={args.plex_token}"
+        resp = requests.get(url)
+        resp.raise_for_status()
+    except Exception as e:
+        logging.error(f"Failed to trigger Plex rescan: {e}")
+        raise Exception(e)
+
+    for sect in minidom.parseString(resp.text).getElementsByTagName('Directory'):
+        sections.append({
+            'Section Name': sect.getAttribute('title'),
+            'Section ID': sect.getAttribute('key')})
+
+    return sections
 
 
 def main():
@@ -123,6 +141,8 @@ def main():
     parser.add_argument("--plex-token", default=os.environ.get("PLEX_TOKEN"))
     parser.add_argument("--plex-section-id",
                         default=os.environ.get("PLEX_MUSIC_SECTION_ID"))
+    parser.add_argument("--plex-list-sections",
+                        default=False, action='store_true')
 
     parser.add_argument(
         "--download-dir", default=os.environ.get("LOCAL_DOWNLOAD_DIR", "/music"))
@@ -134,6 +154,11 @@ def main():
 
     setup_logging(args.log_path)
 
+    if args.plex_list_sections:
+        # if the user requested a list of sections, print and exit
+        pprint(plex_list_sections(args))
+        sys.exit(0)
+
     if not args.ytdl_url or not args.ytdl_api_key:
         logging.error("YTDL URL and API key are required.")
         sys.exit(1)
@@ -144,12 +169,12 @@ def main():
         sys.exit(1)
 
     try:
+        ytdl_auth_params = {"apiKey": args.ytdl_api_key}
         with FileLock(str(lock_path)):
-            jwt_token = None
             if args.ytdl_user and args.ytdl_password:
-                jwt_token = ytdl_authenticate(
+                ytdl_auth_params['jwt'] = ytdl_authenticate(
                     args.ytdl_url, args.ytdl_user, args.ytdl_password, args.ytdl_api_key)
-                if not jwt_token:
+                if not ytdl_auth_params.get('jwt', False):
                     logging.error("Authentication failed, exiting.")
                     sys.exit(1)
             else:
@@ -157,17 +182,17 @@ def main():
                     "No YTDL username/password provided, will attempt unauthenticated sync (all files).")
 
             files = fetch_file_list(
-                args.ytdl_url, args.ytdl_api_key, jwt_token)
+                args.ytdl_url, ytdl_auth_params)
             if files is None:
                 logging.error("Unable to retrieve files, exiting.")
                 sys.exit(1)
 
             os.makedirs(args.download_dir, exist_ok=True)
 
-            for file in files:
+            for file in files['mp3s']:
                 filename = file["title"]
-                file_url = f"{args.ytdl_url}/api/files/download/{file['uid']}?apiKey={args.ytdl_api_key}"
-                dest_path = Path(args.download_dir) / filename
+                dest_path = Path(args.download_dir) / \
+                    os.path.basename(file['path'])
 
                 if dest_path.exists():
                     logging.info(f"File already exists: {filename}, skipping.")
@@ -175,10 +200,8 @@ def main():
 
                 try:
                     logging.info(f"Downloading: {filename}")
-                    download_file(file_url, dest_path)
+                    download_file(args, file, dest_path, ytdl_auth_params)
                     logging.info(f"Downloaded: {filename}")
-                    delete_file(args.ytdl_url,
-                                file["uid"], args.ytdl_api_key, jwt_token)
                 except Exception as e:
                     logging.error(f"Error processing {filename}: {e}")
 
