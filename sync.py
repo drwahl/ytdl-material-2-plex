@@ -6,17 +6,13 @@ from pathlib import Path
 from pprint import pprint
 from xml.dom import minidom
 import argparse
-import json
 import logging
 import os
 import requests
-import shutil
 import sys
-import time
 
 
 def load_config():
-    """Load .env config"""
     config_path = os.environ.get("CONFIG_PATH")
     if not config_path:
         home_env = Path.home() / ".ytdl_sync.env"
@@ -29,8 +25,15 @@ def load_config():
         load_dotenv(dotenv_path=Path(config_path))
 
 
+def _parse_bool_env(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('1', 'true', 'yes')
+    return default
+
+
 def setup_logging(log_path=None):
-    """Setup logging"""
     handlers = [logging.StreamHandler()]
     if log_path:
         try:
@@ -42,10 +45,9 @@ def setup_logging(log_path=None):
                         format='%(levelname)s:%(message)s', handlers=handlers)
 
 
-def ytdl_authenticate(ytdl_url, username, password, api_key):
-    """Authenticate to YTDL to get JWT token"""
+def ytdl_authenticate(session, ytdl_url, username, password, api_key):
     try:
-        auth_resp = requests.post(
+        auth_resp = session.post(
             f"{ytdl_url}/api/auth/login",
             json={"username": username, "password": password},
             params={"apiKey": api_key}
@@ -57,10 +59,9 @@ def ytdl_authenticate(ytdl_url, username, password, api_key):
         return None
 
 
-def fetch_file_list(ytdl_url, auth_params):
-    """Fetch file list"""
+def fetch_file_list(session, ytdl_url, auth_params):
     try:
-        resp = requests.get(f"{ytdl_url}/api/getMp3s", params=auth_params)
+        resp = session.get(f"{ytdl_url}/api/getMp3s", params=auth_params)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -68,61 +69,66 @@ def fetch_file_list(ytdl_url, auth_params):
         return None
 
 
-def download_file(args, file, dest_path, auth_params):
-    """Download file"""
+def download_file(session, args, file, dest_path, auth_params):
     try:
-        result = requests.post(
+        with session.post(
             f'{args.ytdl_url}/api/downloadFileFromServer',
             params=auth_params,
             headers={'Content-type': 'application/json'},
-            json={"uid": file['uid'], "type": "audio"})
-        result.raise_for_status()
-        with open(dest_path, 'wb') as f:
-            f.write(result.content)
+            json={"uid": file['uid'], "type": "audio"},
+            stream=True,
+        ) as result:
+            result.raise_for_status()
+            with open(dest_path, 'wb') as f:
+                for chunk in result.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return True
     except Exception as e:
         logging.error(f"Failed to download/save file {file['uid']}: {e}")
+        dest_path.unlink(missing_ok=True)
+        return False
 
 
-def delete_file(args, file, auth_params):
-    """Delete file on YTDL"""
+def delete_file(session, args, file, auth_params):
     try:
-        resp = requests.post(
+        resp = session.post(
             f"{args.ytdl_url}/api/deleteFile",
             headers={"Content-type": "application/json"},
             params=auth_params,
             json={"uid": file['uid']})
         resp.raise_for_status()
     except Exception as e:
-        logging.error(f"Failed to delete file {file_uid}: {e}")
+        logging.error(f"Failed to delete file {file['uid']}: {e}")
 
 
-def trigger_plex_rescan(plex_url, plex_token, section_id):
-    """Trigger Plex rescan"""
+def trigger_plex_rescan(session, plex_url, plex_token, section_id):
     try:
-        url = f"{plex_url}/library/sections/{section_id}/refresh?X-Plex-Token={plex_token}"
-        resp = requests.get(url)
+        resp = session.get(
+            f"{plex_url}/library/sections/{section_id}/refresh",
+            headers={"X-Plex-Token": plex_token},
+        )
         resp.raise_for_status()
         logging.info("Plex rescan triggered.")
     except Exception as e:
         logging.error(f"Failed to trigger Plex rescan: {e}")
 
 
-def plex_list_sections(args):
-    """List the sections that are registered in Plex"""
-    sections = []
+def plex_list_sections(session, args):
     try:
-        url = f"{args.plex_url}/library/sections?X-Plex-Token={args.plex_token}"
-        resp = requests.get(url)
+        resp = session.get(
+            f"{args.plex_url}/library/sections",
+            headers={"X-Plex-Token": args.plex_token},
+        )
         resp.raise_for_status()
     except Exception as e:
-        logging.error(f"Failed to trigger Plex rescan: {e}")
+        logging.error(f"Failed to list Plex sections: {e}")
         raise Exception(e)
 
+    sections = []
     for sect in minidom.parseString(resp.text).getElementsByTagName('Directory'):
         sections.append({
             'Section Name': sect.getAttribute('title'),
             'Section ID': sect.getAttribute('key')})
-
     return sections
 
 
@@ -137,7 +143,7 @@ def main():
     parser.add_argument(
         "--ytdl-api-key", default=os.environ.get("YTDL_API_KEY"))
     parser.add_argument("--ytdl-cleanup-synced",
-                        default=os.environ.get("YTDL_CLEANUP_SYNCED", False),
+                        default=_parse_bool_env(os.environ.get("YTDL_CLEANUP_SYNCED", False)),
                         action='store_true')
 
     parser.add_argument("--plex-url", default=os.environ.get("PLEX_URL"))
@@ -157,9 +163,10 @@ def main():
 
     setup_logging(args.log_path)
 
+    session = requests.Session()
+
     if args.plex_list_sections:
-        # if the user requested a list of sections, print and exit
-        pprint(plex_list_sections(args))
+        pprint(plex_list_sections(session, args))
         sys.exit(0)
 
     if not args.ytdl_url or not args.ytdl_api_key:
@@ -173,10 +180,10 @@ def main():
 
     try:
         ytdl_auth_params = {"apiKey": args.ytdl_api_key}
-        with FileLock(str(lock_path)):
+        with FileLock(str(lock_path), timeout=0):
             if args.ytdl_user and args.ytdl_password:
                 ytdl_auth_params['jwt'] = ytdl_authenticate(
-                    args.ytdl_url, args.ytdl_user, args.ytdl_password, args.ytdl_api_key)
+                    session, args.ytdl_url, args.ytdl_user, args.ytdl_password, args.ytdl_api_key)
                 if not ytdl_auth_params.get('jwt', False):
                     logging.error("Authentication failed, exiting.")
                     sys.exit(1)
@@ -184,14 +191,14 @@ def main():
                 logging.warning(
                     "No YTDL username/password provided, will attempt unauthenticated sync (all files).")
 
-            files = fetch_file_list(
-                args.ytdl_url, ytdl_auth_params)
+            files = fetch_file_list(session, args.ytdl_url, ytdl_auth_params)
             if files is None:
                 logging.error("Unable to retrieve files, exiting.")
                 sys.exit(1)
 
             os.makedirs(args.download_dir, exist_ok=True)
 
+            downloaded_count = 0
             for file in files['mp3s']:
                 filename = file["title"]
                 dest_path = Path(args.download_dir) / \
@@ -201,22 +208,20 @@ def main():
                     logging.info(f"File already exists: {filename}, skipping.")
                     continue
 
-                try:
-                    logging.info(f"Downloading: {filename}")
-                    download_file(args, file, dest_path, ytdl_auth_params)
+                logging.info(f"Downloading: {filename}")
+                if download_file(session, args, file, dest_path, ytdl_auth_params):
                     logging.info(f"Downloaded: {filename}")
-                except Exception as e:
-                    logging.error(f"Error processing {filename}: {e}")
+                    downloaded_count += 1
 
-            if args.plex_url and args.plex_token and args.plex_section_id:
+            if downloaded_count > 0 and args.plex_url and args.plex_token and args.plex_section_id:
                 trigger_plex_rescan(
-                    args.plex_url, args.plex_token, args.plex_section_id)
+                    session, args.plex_url, args.plex_token, args.plex_section_id)
 
             if args.ytdl_cleanup_synced:
+                logging.info("Cleaning up synced files from YTDL.")
                 for file in files['mp3s']:
-                    logging.info("Cleaning up synced files from YTDL.")
-                    delete_file(args, file, ytdl_auth_params)
-                    logging.info("Successfully removed synced files from YTDL.")
+                    delete_file(session, args, file, ytdl_auth_params)
+                logging.info("Cleanup complete.")
 
             logging.info("Sync completed.")
     except Timeout:

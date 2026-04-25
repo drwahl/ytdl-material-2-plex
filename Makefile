@@ -21,13 +21,13 @@ autopep:
 test:
 	python -m pytest \
 	        -v \
-	        --cov=storops \
+	        --cov=sync \
 	        --cov-report=term \
 	        --cov-report=html:coverage-report \
 	        tests/
 
 docker: clean
-	docker build -t storops:latest .
+	docker build -t ytdl-sync:latest .
 
 dist: clean
 	rm -rf dist/*
