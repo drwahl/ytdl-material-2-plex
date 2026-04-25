@@ -28,6 +28,11 @@ A `filelock` mutex (`/tmp/ytdl_sync.lock` by default) prevents concurrent runs.
 | `delete_file()` | POSTs to `/api/deleteFile` to remove a file from YTDL |
 | `trigger_plex_rescan()` | GETs the Plex `/library/sections/{id}/refresh` endpoint |
 | `plex_list_sections()` | Lists available Plex library sections (XML response) |
+| `sanitize_path_component()` | Strips `/`, `:`, `*`, etc. from a string so it's safe as a dir name |
+| `parse_artist_title()` | Splits `"Artist - Title"` YouTube convention; falls back to `uploader` |
+| `lookup_musicbrainz()` | Text-searches MusicBrainz for a recording; returns first hit or `None` |
+| `tag_file()` | Writes ID3 tags; returns `dict` of applied tags (empty dict on failure) |
+| `organize_file()` | Moves a tagged file to `music_dir/Artist/Album/filename` |
 
 A single `requests.Session` is passed through all functions to reuse the
 underlying TCP connection.
@@ -43,6 +48,9 @@ All options can be set via env var or CLI flag:
 | `YTDL_PASSWORD` | `--ytdl-password` | — | ytdl-material password |
 | `YTDL_API_KEY` | `--ytdl-api-key` | — | ytdl-material API key (required) |
 | `YTDL_CLEANUP_SYNCED` | `--ytdl-cleanup-synced` | `false` | Delete files from YTDL after sync |
+| `YTDL_SKIP_TAGGING` | `--skip-tagging` | `false` | Skip MusicBrainz lookup, ID3 tagging, and file organization |
+| `LOCAL_DOWNLOAD_DIR` | `--download-dir` | `/music/incoming` | Drop-off/staging directory for ytdl files |
+| `PLEX_MUSIC_DIR` | `--music-dir` | — | Organized library root; tagged files move to `Artist/Album/` here |
 | `PLEX_URL` | `--plex-url` | — | Plex base URL |
 | `PLEX_TOKEN` | `--plex-token` | — | Plex API token |
 | `PLEX_MUSIC_SECTION_ID` | `--plex-section-id` | — | Plex library section ID |
@@ -99,6 +107,34 @@ make test          # pytest with coverage
 ```
 
 Dev dependencies live in `requirements-dev.txt`.
+
+## Tagging and Organization
+
+The tag + organize phase runs on **all** MP3 files currently in `--download-dir` — both files downloaded in the current run (which have YTDL metadata available) and files left over from previous runs (backlog, metadata from filename/MusicBrainz only). It never touches `--music-dir` or anything outside `--download-dir`.
+
+**Artist/title detection order:**
+1. If the YTDL `title` field contains ` - `, split it as `Artist - Track title`
+2. Otherwise use `uploader` (YouTube channel name) as artist and the full title as track title
+3. For backlog files (no YTDL object), fall back to the filename stem
+
+**MusicBrainz lookup:**
+- Uses `musicbrainzngs.search_recordings(recording=title, artist=artist)`
+- Rate-limited to 1 request/second (MusicBrainz requirement)
+- On a match: writes `TIT2` (title), `TPE1` (artist), `TALB` (album), `TDRC` (year) from the first result
+- On no match: writes `TIT2`, `TPE1` from parsed YTDL/filename data, `TDRC` from `upload_date`
+- `tag_file()` returns a `dict` of what was applied (keys: `title`, `artist`, `album`, `year`)
+
+**File organization:**
+- If `--music-dir` is set, `organize_file()` moves the file to `music_dir/Artist/Album/filename`
+- Artist and album names are sanitized (`:`, `*`, `/`, etc. → `-`) before becoming directory components
+- Files that already exist at the destination are skipped (not overwritten)
+- If `--music-dir` is not set, files are tagged in-place in `--download-dir`
+
+**Plex rescan trigger:**
+- If `--music-dir` is set: triggers when at least one file was successfully moved there
+- If `--music-dir` is not set: triggers when at least one file was newly downloaded
+
+Set `YTDL_SKIP_TAGGING=true` to disable tagging, organization, and the backlog scan entirely.
 
 ## Known Behaviour / Gotchas
 

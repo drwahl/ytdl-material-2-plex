@@ -6,6 +6,9 @@ Sync audio files from [ytdl-material](https://github.com/Tzahi12345/YoutubeDL-Ma
 
 - Syncs downloaded audio files via the ytdl-material API
 - Skips files that already exist locally (idempotent)
+- Tags and organizes audio files from the drop-off directory — both newly downloaded and files left from previous runs
+- Looks up ID3 metadata via MusicBrainz (falls back to YTDL metadata / filename)
+- Moves tagged files into `Artist/Album/` structure under the configured music library directory
 - Optionally deletes files from ytdl-material after syncing
 - Triggers a Plex library rescan when new files are downloaded
 - Runs cleanly in Docker and supports scheduled execution via cron
@@ -21,10 +24,12 @@ All options can also be passed as CLI flags (e.g. `--ytdl-url`).
 | `YTDL_USER` | no | — | ytdl-material username (for authenticated sync) |
 | `YTDL_PASSWORD` | no | — | ytdl-material password (for authenticated sync) |
 | `YTDL_CLEANUP_SYNCED` | no | `false` | Delete files from YTDL after syncing (`true`/`1`/`yes`) |
+| `YTDL_SKIP_TAGGING` | no | `false` | Skip MusicBrainz lookup and ID3 tagging |
 | `PLEX_URL` | no | — | Plex base URL (e.g. `http://plex.local:32400`) |
 | `PLEX_TOKEN` | no | — | Plex API token |
 | `PLEX_MUSIC_SECTION_ID` | no | — | Plex library section ID for music |
-| `LOCAL_DOWNLOAD_DIR` | no | `/music` | Target directory for downloaded files |
+| `LOCAL_DOWNLOAD_DIR` | no | `/music/incoming` | Drop-off/staging directory where ytdl files land |
+| `PLEX_MUSIC_DIR` | no | — | Organized library root; tagged files move here as `Artist/Album/filename` |
 | `LOCK_FILE_PATH` | no | `/tmp/ytdl_sync.lock` | Path to the mutex lock file |
 | `LOG_PATH` | no | — | Write logs to this file in addition to stdout |
 | `CONFIG_PATH` | no | — | Explicit path to a `.env` config file |
@@ -49,8 +54,10 @@ YTDL_PASSWORD=secret
 PLEX_URL=http://plex.local:32400
 PLEX_TOKEN=your_plex_token
 PLEX_MUSIC_SECTION_ID=4
-LOCAL_DOWNLOAD_DIR=/music
+LOCAL_DOWNLOAD_DIR=/music/incoming
+PLEX_MUSIC_DIR=/music
 YTDL_CLEANUP_SYNCED=false
+YTDL_SKIP_TAGGING=false
 ```
 
 ## Discovering Your Plex Section ID
@@ -66,11 +73,15 @@ docker run --rm \
   -v /path/on/host/music:/music \
   -e YTDL_URL=http://ytdl.local:17442 \
   -e YTDL_API_KEY=your_api_key \
+  -e LOCAL_DOWNLOAD_DIR=/music/incoming \
+  -e PLEX_MUSIC_DIR=/music \
   -e PLEX_URL=http://plex.local:32400 \
   -e PLEX_TOKEN=your_plex_token \
   -e PLEX_MUSIC_SECTION_ID=4 \
   drwahl/ytdl-sync:latest
 ```
+
+The container writes downloaded files to `LOCAL_DOWNLOAD_DIR`, tags them (via MusicBrainz), and moves them into `PLEX_MUSIC_DIR/Artist/Album/`. Mount both paths to the same host volume or two separate ones depending on your layout.
 
 ## Docker Compose
 

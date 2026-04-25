@@ -10,17 +10,21 @@ services:
       YTDL_USER: user
       YTDL_PASSWORD: pass
       YTDL_API_KEY: keykeykey
+      # YTDL_CLEANUP_SYNCED: "false"
       ## Plex config
       PLEX_URL: http://plex.local:32400
       PLEX_TOKEN: your_plex_token
       PLEX_MUSIC_SECTION_ID: "1"
-      # location within container to download the files to
-      LOCAL_DOWNLOAD_DIR: /music
+      ## Directory config
+      # Drop-off: ytdl files land here; tagging + organization runs on everything in this dir
+      LOCAL_DOWNLOAD_DIR: /music/incoming
+      # Organized library root: tagged files move to Artist/Album/ under this path
+      PLEX_MUSIC_DIR: /music
       # LOG_PATH: /logs/ytdl_sync.log
       LOCK_FILE_PATH: /tmp/ytdl_sync.lock
 
     volumes:
-      # Mount your music library directory here
+      # Mount your music library (both incoming staging and organized library)
       - /path/on/host/music:/music:rw
 
       # Optional: mount a logs directory if LOG_PATH is set

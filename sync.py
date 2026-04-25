@@ -2,14 +2,24 @@
 
 from dotenv import load_dotenv
 from filelock import FileLock, Timeout
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC
+from mutagen.id3 import error as ID3Error
+from mutagen.mp3 import MP3
 from pathlib import Path
 from pprint import pprint
 from xml.dom import minidom
 import argparse
 import logging
+import musicbrainzngs
 import os
+import re
 import requests
+import shutil
 import sys
+
+MB_APP = "ytdl-material-2-plex"
+MB_VERSION = "1.0"
+MB_CONTACT = "https://github.com/drwahl/ytdl-material-2-plex"
 
 
 def load_config():
@@ -132,6 +142,130 @@ def plex_list_sections(session, args):
     return sections
 
 
+def sanitize_path_component(name):
+    """Replace filesystem-hostile characters so the string is safe as a dir name."""
+    name = re.sub(r'[/\\:*?"<>|]', '-', name)
+    name = re.sub(r'-{2,}', '-', name).strip(' .-')
+    return name or 'Unknown'
+
+
+def parse_artist_title(raw_title, uploader=None):
+    """Split 'Artist - Title' YouTube convention; fall back to uploader as artist."""
+    if ' - ' in raw_title:
+        artist, title = raw_title.split(' - ', 1)
+        return artist.strip(), title.strip()
+    return uploader or None, raw_title
+
+
+def lookup_musicbrainz(title, artist=None):
+    """Text-search MusicBrainz for a recording. Returns first match or None."""
+    try:
+        kwargs = {'recording': title, 'limit': 5}
+        if artist:
+            kwargs['artist'] = artist
+        result = musicbrainzngs.search_recordings(**kwargs)
+        recordings = result.get('recording-list', [])
+        if recordings:
+            return recordings[0]
+    except musicbrainzngs.WebServiceError as e:
+        logging.warning(f"MusicBrainz lookup failed for '{title}': {e}")
+    return None
+
+
+def tag_file(dest_path, file=None):
+    """Tag an MP3 with ID3 metadata from MusicBrainz (falling back to YTDL/filename data).
+
+    Returns a dict of the tags that were applied, or an empty dict on failure.
+    The 'file' argument is the YTDL API object; pass None for backlog files.
+    """
+    file = file or {}
+    raw_title = file.get('title', '') or dest_path.stem
+    uploader = file.get('uploader', '') or ''
+    upload_date = file.get('upload_date', '') or ''
+
+    artist, title = parse_artist_title(raw_title, uploader or None)
+
+    mb = lookup_musicbrainz(title, artist)
+    applied = {}
+
+    try:
+        audio = MP3(str(dest_path), ID3=ID3)
+        try:
+            audio.add_tags()
+        except ID3Error:
+            pass  # tags already present
+
+        if mb:
+            mb_title = mb.get('title', title)
+            audio.tags['TIT2'] = TIT2(encoding=3, text=mb_title)
+            applied['title'] = mb_title
+
+            credits = mb.get('artist-credit', [])
+            mb_artist = ''
+            for credit in credits:
+                if isinstance(credit, dict) and 'artist' in credit:
+                    mb_artist = credit['artist'].get('name', '')
+                    break
+            final_artist = mb_artist or artist or ''
+            audio.tags['TPE1'] = TPE1(encoding=3, text=final_artist)
+            applied['artist'] = final_artist
+
+            releases = mb.get('release-list', [])
+            if releases:
+                release = releases[0]
+                if release.get('title'):
+                    audio.tags['TALB'] = TALB(encoding=3, text=release['title'])
+                    applied['album'] = release['title']
+                date = release.get('date', '')
+                if date:
+                    audio.tags['TDRC'] = TDRC(encoding=3, text=date[:4])
+                    applied['year'] = date[:4]
+
+            logging.info(f"Tagged from MusicBrainz: {dest_path.name}")
+        else:
+            audio.tags['TIT2'] = TIT2(encoding=3, text=title)
+            applied['title'] = title
+            if artist:
+                audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
+                applied['artist'] = artist
+            # upload_date is YYYYMMDD from YTDL; take the year
+            if len(upload_date) >= 4:
+                audio.tags['TDRC'] = TDRC(encoding=3, text=upload_date[:4])
+                applied['year'] = upload_date[:4]
+            logging.info(f"Tagged from YTDL metadata (no MusicBrainz match): {dest_path.name}")
+
+        audio.save()
+    except Exception as e:
+        logging.warning(f"Failed to tag {dest_path.name}: {e}")
+
+    return applied
+
+
+def organize_file(src_path, music_dir, tags):
+    """Move src_path to music_dir/Artist/Album/filename based on applied tags.
+
+    Returns the new Path on success, None if the destination already exists or
+    the move fails.
+    """
+    artist = sanitize_path_component(tags.get('artist') or 'Unknown Artist')
+    album = sanitize_path_component(tags.get('album') or 'Unknown Album')
+    dest_dir = Path(music_dir) / artist / album
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src_path.name
+
+    if dest.exists():
+        logging.warning(f"Destination already exists, skipping move: {dest}")
+        return None
+
+    try:
+        shutil.move(str(src_path), str(dest))
+        logging.info(f"Organized: {src_path.name} -> {artist}/{album}/")
+        return dest
+    except Exception as e:
+        logging.error(f"Failed to move {src_path.name} to {dest}: {e}")
+        return None
+
+
 def main():
     load_config()
 
@@ -154,14 +288,23 @@ def main():
                         default=False, action='store_true')
 
     parser.add_argument(
-        "--download-dir", default=os.environ.get("LOCAL_DOWNLOAD_DIR", "/music"))
+        "--download-dir", default=os.environ.get("LOCAL_DOWNLOAD_DIR", "/music/incoming"))
+    parser.add_argument(
+        "--music-dir", default=os.environ.get("PLEX_MUSIC_DIR"))
     parser.add_argument(
         "--lock-file", default=os.environ.get("LOCK_FILE_PATH", "/tmp/ytdl_sync.lock"))
     parser.add_argument("--log-path", default=os.environ.get("LOG_PATH"))
+    parser.add_argument("--skip-tagging",
+                        default=_parse_bool_env(os.environ.get("YTDL_SKIP_TAGGING", False)),
+                        action='store_true')
 
     args = parser.parse_args()
 
     setup_logging(args.log_path)
+
+    if not args.skip_tagging:
+        musicbrainzngs.set_useragent(MB_APP, MB_VERSION, MB_CONTACT)
+        musicbrainzngs.set_rate_limit(True)
 
     session = requests.Session()
 
@@ -198,11 +341,12 @@ def main():
 
             os.makedirs(args.download_dir, exist_ok=True)
 
-            downloaded_count = 0
+            # Download phase: pull any files not already in the drop-off dir.
+            # Track (path, ytdl_file) pairs so the tag phase has YTDL metadata.
+            newly_downloaded: list[tuple[Path, dict]] = []
             for file in files['mp3s']:
                 filename = file["title"]
-                dest_path = Path(args.download_dir) / \
-                    os.path.basename(file['path'])
+                dest_path = Path(args.download_dir) / os.path.basename(file['path'])
 
                 if dest_path.exists():
                     logging.info(f"File already exists: {filename}, skipping.")
@@ -211,9 +355,38 @@ def main():
                 logging.info(f"Downloading: {filename}")
                 if download_file(session, args, file, dest_path, ytdl_auth_params):
                     logging.info(f"Downloaded: {filename}")
-                    downloaded_count += 1
+                    newly_downloaded.append((dest_path, file))
 
-            if downloaded_count > 0 and args.plex_url and args.plex_token and args.plex_section_id:
+            # Tag + organize phase: process every MP3 in the drop-off dir.
+            # Newly downloaded files have YTDL metadata available.
+            # Backlog files (from prior runs) use filename/MusicBrainz only.
+            organized_count = 0
+            if not args.skip_tagging:
+                newly_downloaded_paths = {p for p, _ in newly_downloaded}
+
+                # Build a map for quick YTDL metadata lookup by path
+                ytdl_meta: dict[Path, dict] = {p: f for p, f in newly_downloaded}
+
+                backlog = [
+                    p for p in sorted(Path(args.download_dir).glob('*.mp3'))
+                    if p not in newly_downloaded_paths
+                ]
+                if backlog:
+                    logging.info(f"Found {len(backlog)} backlog file(s) in drop-off to tag/organize.")
+
+                all_to_process = [p for p, _ in newly_downloaded] + backlog
+
+                for src_path in all_to_process:
+                    tags = tag_file(src_path, ytdl_meta.get(src_path))
+                    if args.music_dir:
+                        if organize_file(src_path, args.music_dir, tags):
+                            organized_count += 1
+
+            # Plex rescan: trigger when files actually landed in the music library.
+            # If music_dir is set, that means organized files; otherwise, newly downloaded
+            # files went directly into download_dir (which is presumably the library).
+            needs_rescan = (organized_count > 0) if args.music_dir else (len(newly_downloaded) > 0)
+            if needs_rescan and args.plex_url and args.plex_token and args.plex_section_id:
                 trigger_plex_rescan(
                     session, args.plex_url, args.plex_token, args.plex_section_id)
 
